@@ -1,0 +1,153 @@
+SELECT * FROM `aiagentjoe.retail.RFM`;
+-- Create a clean view (type casting & basic normalization)
+CREATE OR REPLACE VIEW `aiagentjoe.retail.RFM_clean` AS
+WITH raw AS (
+  SELECT
+    SAFE_CAST(Invoice AS STRING)       AS invoice_id,
+    SAFE_CAST(StockCode AS STRING)     AS stock_code,
+    TRIM(CAST(Description AS STRING))  AS description,
+    SAFE_CAST(Quantity AS INT64)       AS quantity,
+    SAFE_CAST(Price AS NUMERIC)        AS unit_price,
+    SAFE_CAST(`Customer ID` AS STRING) AS customer_id,
+    TRIM(CAST(Country AS STRING))      AS country,
+    InvoiceDate                        AS invoice_ts      -- already TIMESTAMP
+  FROM `aiagentjoe.retail.RFM`
+),
+-- text canonicalization & row tagging
+NORM as(
+  SELECT
+    invoice_id,
+    stock_code,
+    UPPER(REGEXP_REPLACE(description, r'\s+', ' ')) AS description,
+    quantity,
+    unit_price,
+    customer_id,
+    UPPER(TRIM(country)) AS country,
+    invoice_ts,
+    STARTS_WITH(invoice_id, 'C') AS is_credit_note,
+    /* This flag often over-filters legit SKUs. Keep as a flag only. */
+    FALSE AS non_numeric_code,
+    REGEXP_CONTAINS(UPPER(description),
+      r'\b(POSTAGE|CARRIAGE|ADJUSTMENT|SAMPLE|GIFT\s*VOUCHER|BANK\s*CHARGES)\b') AS is_service_fee
+  FROM raw
+),
+---drop exact duplicates
+dedup AS (
+  SELECT *
+  FROM (
+    SELECT
+      *,
+      ROW_NUMBER() OVER (
+        PARTITION BY invoice_id, stock_code, description, quantity, unit_price, customer_id, country, invoice_ts
+      ) AS rn
+    FROM norm
+  )
+  WHERE rn = 1
+),
+--compute capping thresholds (winsorization)
+p99 AS (
+  SELECT
+    APPROX_QUANTILES(ABS(quantity), 100)[OFFSET(99)] AS q99_qty,
+    APPROX_QUANTILES(unit_price, 100)[OFFSET(99)]    AS q99_price
+  FROM dedup
+)
+SELECT
+  d.invoice_id,
+  d.stock_code,
+  d.description,
+  CAST(LEAST(ABS(d.quantity), p.q99_qty) * SIGN(d.quantity) AS INT64) AS quantity,
+  LEAST(d.unit_price, p.q99_price) AS unit_price,
+  d.customer_id,
+  d.country,
+  d.invoice_ts,
+  DATETIME(d.invoice_ts) AS invoice_dt,
+  DATE(d.invoice_ts) AS order_date,                   -- or DATE(d.invoice_ts, 'Europe/London')
+  d.is_credit_note,
+  d.non_numeric_code,
+  d.is_service_fee
+FROM dedup d
+CROSS JOIN p99 p
+WHERE d.customer_id IS NOT NULL
+  AND d.invoice_id  IS NOT NULL
+  AND d.invoice_ts  IS NOT NULL;
+-- Also compiles; returns no rows, shows columns
+SELECT * FROM `aiagentjoe.retail.RFM_clean`;
+
+--create an order_view(order-level revenue)
+CREATE OR REPLACE VIEW `aiagentjoe.retail.customer_orders_v` AS
+WITH base AS (
+  SELECT
+    customer_id,
+    invoice_id,
+    order_date,  
+    CAST(quantity AS NUMERIC) * unit_price AS line_amount
+  FROM `aiagentjoe.retail.RFM_clean`
+  WHERE is_service_fee = FALSE
+    AND unit_price > 0
+    -- do NOT filter quantity sign or credit notes here; let negatives net out
+),
+orders AS (
+  SELECT
+    customer_id,
+    invoice_id,
+    order_date,
+    SUM(line_amount) AS order_revenue
+  FROM base
+  GROUP BY 1,2,3
+)
+SELECT *
+FROM orders
+WHERE order_revenue > 0;
+
+SELECT * FROM `aiagentjoe.retail.customer_orders_v`;
+
+--create a segment_view(customer-level RFM)
+--aggregate invoices to the customer level
+CREATE OR REPLACE TABLE `aiagentjoe.retail.customer_segments` AS
+WITH cust AS (
+  SELECT
+    customer_id,
+    COUNT(DISTINCT invoice_id) AS orders,
+    SUM(order_revenue) AS revenue,
+    AVG(order_revenue) AS aov,
+    MIN(order_date) AS first_order,
+    MAX(order_date) AS last_order
+  FROM `aiagentjoe.retail.customer_orders_v`
+  GROUP BY 1
+),
+--maxd — get the analysis “as-of” date
+maxd AS (SELECT MAX(order_date) AS max_dt FROM `aiagentjoe.retail.customer_orders_v`),
+--derive recency & tenure
+rfm AS (
+  SELECT
+    c.*,
+    DATE_DIFF(m.max_dt, c.last_order, DAY) AS recency_days,
+    ROUND(DATE_DIFF(m.max_dt, c.first_order, DAY) / 30.0, 1) AS tenure_months
+  FROM cust c CROSS JOIN maxd m
+),
+--scored — convert R/F/M to quartile scores
+scored AS (
+  SELECT
+    rfm.*,
+    NTILE(4) OVER (ORDER BY recency_days ASC) AS r4,  
+    NTILE(4) OVER (ORDER BY orders DESC)       AS f4,
+    NTILE(4) OVER (ORDER BY revenue DESC)      AS m4
+  FROM rfm
+)
+-- score, label, and write the table
+SELECT
+  *,
+  (r4 + f4 + m4) AS rfm_score,
+  CASE
+    WHEN r4=4 AND f4>=3 AND m4>=3 THEN 'Champions'
+    WHEN r4>=3 AND f4>=3 THEN 'Loyal'
+    WHEN r4=4 AND f4=1 THEN 'New'
+    WHEN r4<=2 AND f4>=3 THEN 'At Risk Loyalists'
+    WHEN r4<=2 AND m4<=2 THEN 'At Risk'
+    ELSE 'Regular'
+  END AS segment
+FROM scored;
+
+SELECT * FROM `aiagentjoe.retail.customer_segments`
+--where segment = "New"
+;
